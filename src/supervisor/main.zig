@@ -188,11 +188,10 @@ const Model = struct {
         const total_mib = self.hardware.memory_total_bytes / (1024 * 1024);
         const provider = if (self.hardware.supported) "native" else "not available";
         const body = try std.fmt.allocPrint(ctx.allocator,
-            "{s}\nCPU    {d:>5.1}%  {s}\n{s}\nRAM    {d:>5.1}%  {d}/{d} MiB\n{s}\nLoad   {d:.2}    Processes {d}\nProvider: {s}",
+            "{s}\nCPU    {d:.1}%\n{s}\nRAM    {d:.1}%  {d}/{d} MiB\n{s}\nLoad   {d:.2}    Processes {d}\nProvider: {s}",
             .{
                 h,
                 self.hardware.cpu_percent,
-                "",
                 cpu_graph,
                 self.hardware.memory_percent,
                 used_mib,
@@ -218,7 +217,7 @@ const Model = struct {
         while (index < self.recent_len) : (index += 1) {
             const event = self.recent_events[index] orelse continue;
             const line = try std.fmt.allocPrint(ctx.allocator,
-                "#{d:<4} {s:<18} {s}",
+                "#{d}  {s}  {s}",
                 .{ event.sequence, @tagName(event.kind), event.entity.canonical_name.slice() },
             );
             lines = try zz.joinVertical(ctx.allocator, &.{ lines, line });
