@@ -1,12 +1,15 @@
+const std = @import("std");
 const protocol_mod = @import("protocol.zig");
 const event_bus_mod = @import("event_bus.zig");
 const actor_mod = @import("actor_supervisor.zig");
 const command_mod = @import("command_registry.zig");
+const stdio_mod = @import("stdio_bridge.zig");
 
 pub const protocol = protocol_mod;
 pub const event_bus = event_bus_mod;
 pub const actors = actor_mod;
 pub const commands = command_mod;
+pub const stdio_bridge = stdio_mod;
 
 pub const RuntimeEvent = protocol_mod.RuntimeEvent;
 pub const RuntimeCommand = protocol_mod.RuntimeCommand;
@@ -94,7 +97,7 @@ pub const DevelopmentSupervisor = struct {
             .events_dropped = self.bus.coalesced_or_dropped,
         };
 
-        for (&self.action_supervisor.slots) |*slot| {
+        for (&self.action_supervisor.slots) |slot| {
             if (!slot.active) continue;
             switch (slot.state) {
                 .running => out.actors_running += 1,
@@ -119,7 +122,7 @@ pub const DevelopmentSupervisor = struct {
         timestamp_ns: u64,
     ) !void {
         var id_buf: [32]u8 = undefined;
-        const actor_id_text = stdFmtActorId(&id_buf, actor_id);
+        const actor_id_text = formatActorId(&id_buf, actor_id);
         const entity = try EntityRef.init(.actor, actor_id_text, canonical_name);
         var event = RuntimeEvent{
             .sequence = self.bus.reserveSequence(),
@@ -134,7 +137,7 @@ pub const DevelopmentSupervisor = struct {
     }
 };
 
-fn stdFmtActorId(buf: []u8, value: actor_mod.ActorId) []const u8 {
+fn formatActorId(buf: []u8, value: actor_mod.ActorId) []const u8 {
     var index = buf.len;
     var n = value;
     if (n == 0) {
@@ -144,13 +147,12 @@ fn stdFmtActorId(buf: []u8, value: actor_mod.ActorId) []const u8 {
     }
     while (n > 0) {
         index -= 1;
-        buf[index] = @intCast('0' + (n % 10));
+        const digit: u8 = @intCast(n % 10);
+        buf[index] = '0' + digit;
         n /= 10;
     }
     return buf[index..];
 }
-
-const std = @import("std");
 
 test "DevelopmentSupervisor emits ActionActor lifecycle" {
     var supervisor = try DevelopmentSupervisor.init("project-1", "runtime-1");
