@@ -3,6 +3,7 @@ const protocol_mod = @import("protocol.zig");
 const event_bus_mod = @import("event_bus.zig");
 const actor_mod = @import("actor_supervisor.zig");
 const command_mod = @import("command_registry.zig");
+const queue_mod = @import("bounded_queue.zig");
 const stdio_mod = @import("stdio_bridge.zig");
 const telemetry_mod = @import("telemetry.zig");
 
@@ -10,6 +11,7 @@ pub const protocol = protocol_mod;
 pub const event_bus = event_bus_mod;
 pub const actors = actor_mod;
 pub const commands = command_mod;
+pub const bounded_queue = queue_mod;
 pub const stdio_bridge = stdio_mod;
 pub const telemetry = telemetry_mod;
 
@@ -27,23 +29,37 @@ pub const ActionFn = actor_mod.ActionFn;
 pub const DefaultEventBus = event_bus_mod.EventBus(4, 32);
 pub const DefaultActionSupervisor = actor_mod.ActionSupervisor(16, 64 * 1024, 4);
 pub const DefaultCommandRegistry = command_mod.CommandRegistry(64);
+pub const DefaultCommandQueue = queue_mod.CommandQueue(32);
 
-/// Foundation runtime used by the TUI and transports. All collections are
-/// fixed-capacity. Runtime-critical operations do not grow the heap.
+/// Runtime shared by TUI and remote transports. Runtime-critical collections
+/// have fixed capacity; transport threads submit commands through `command_queue`
+/// and only the owner loop mutates Actor/Supervisor state.
 pub const DevelopmentSupervisor = struct {
     bus: DefaultEventBus = .{},
     action_supervisor: DefaultActionSupervisor = DefaultActionSupervisor.init(),
     command_registry: DefaultCommandRegistry = .{},
+    command_queue: DefaultCommandQueue = .{},
     project_id: protocol_mod.Id = .{},
     runtime_id: protocol_mod.Id = .{},
+    shutdown_requested: bool = false,
 
     const Self = @This();
 
     pub fn init(project_id: []const u8, runtime_id: []const u8) !Self {
-        return .{
+        var self = Self{
             .project_id = try protocol_mod.Id.init(project_id),
             .runtime_id = try protocol_mod.Id.init(runtime_id),
         };
+        try self.registerBuiltins();
+        return self;
+    }
+
+    fn registerBuiltins(self: *Self) !void {
+        try self.command_registry.registerSimple("actor.pause", "actor.control", .mutating, commandActorPause);
+        try self.command_registry.registerSimple("actor.resume", "actor.control", .mutating, commandActorResume);
+        try self.command_registry.registerSimple("actor.cancel", "actor.control", .mutating, commandActorCancel);
+        try self.command_registry.registerSimple("runtime.shutdown", "runtime.admin", .destructive, commandRuntimeShutdown);
+        try self.command_registry.registerSimple("runtime.refresh", "runtime.observe", .observe, commandRuntimeRefresh);
     }
 
     pub fn subscribe(self: *Self) !DefaultEventBus.SubscriberId {
@@ -52,6 +68,32 @@ pub const DevelopmentSupervisor = struct {
 
     pub fn nextEvent(self: *Self, subscriber: DefaultEventBus.SubscriberId) ?RuntimeEvent {
         return self.bus.pop(subscriber);
+    }
+
+    /// Safe entrypoint for REST/WebSocket/stdio/automation producer threads.
+    /// It only touches the mutex-protected bounded queue.
+    pub fn submitCommand(self: *Self, command: RuntimeCommand) !void {
+        try self.command_queue.push(command);
+    }
+
+    /// Called by the owning event loop. Commands are always serialized here,
+    /// so no transport thread mutates Actor or Supervisor state directly.
+    pub fn drainCommands(self: *Self, timestamp_ns: u64, max_commands: usize) usize {
+        var processed: usize = 0;
+        while (processed < max_commands) : (processed += 1) {
+            const command = self.command_queue.pop() orelse break;
+            self.executeCommand(command, timestamp_ns) catch {};
+        }
+        return processed;
+    }
+
+    pub fn executeCommand(self: *Self, command: RuntimeCommand, timestamp_ns: u64) !void {
+        try self.emit(command.target, .command_accepted, .info, timestamp_ns, command.canonical_name.slice());
+        self.command_registry.execute(self, command) catch |err| {
+            try self.emit(command.target, .command_failed, .err, timestamp_ns, @errorName(err));
+            return err;
+        };
+        try self.emit(command.target, .command_completed, .info, timestamp_ns, command.canonical_name.slice());
     }
 
     pub fn spawnAction(
@@ -67,9 +109,9 @@ pub const DevelopmentSupervisor = struct {
         return id;
     }
 
-    /// Run one ActionActor attempt. On memory exhaustion a fresh Actor is
-    /// created immediately and its ID is returned. Higher layers restore the
-    /// durable checkpoint before scheduling the replacement Actor.
+    /// Run one ActionActor attempt. On hard memory exhaustion a fresh Actor is
+    /// created immediately. Durable/checkpoint restoration belongs to the
+    /// persistence layer and happens before scheduling the replacement.
     pub fn runAction(self: *Self, actor_id: actor_mod.ActorId, timestamp_ns: u64) !actor_mod.ActorId {
         const slot = self.action_supervisor.get(actor_id) orelse return error.ActorNotFound;
         const name = slot.canonical_name;
@@ -171,6 +213,33 @@ pub const DevelopmentSupervisor = struct {
         const entity = try EntityRef.init(.actor, actor_id_text, canonical_name);
         try self.emit(entity, kind, severity, timestamp_ns, payload);
     }
+
+    fn actorIdFromCommand(command: RuntimeCommand) !actor_mod.ActorId {
+        if (command.target.kind != .actor) return error.InvalidTarget;
+        return std.fmt.parseInt(actor_mod.ActorId, command.target.id.slice(), 10);
+    }
+
+    fn commandActorPause(ctx: *anyopaque, command: RuntimeCommand) !void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        try self.action_supervisor.pause(try actorIdFromCommand(command));
+    }
+
+    fn commandActorResume(ctx: *anyopaque, command: RuntimeCommand) !void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        try self.action_supervisor.resume(try actorIdFromCommand(command));
+    }
+
+    fn commandActorCancel(ctx: *anyopaque, command: RuntimeCommand) !void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        try self.action_supervisor.cancel(try actorIdFromCommand(command));
+    }
+
+    fn commandRuntimeShutdown(ctx: *anyopaque, _: RuntimeCommand) !void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.shutdown_requested = true;
+    }
+
+    fn commandRuntimeRefresh(_: *anyopaque, _: RuntimeCommand) !void {}
 };
 
 fn formatActorId(buf: []u8, value: actor_mod.ActorId) []const u8 {
@@ -234,4 +303,15 @@ test "DevelopmentSupervisor emits memory pressure before completion" {
         if (event.kind == .memory_pressure) seen_pressure = true;
     }
     try std.testing.expect(seen_pressure);
+}
+
+test "external commands are serialized through bounded queue" {
+    var supervisor = try DevelopmentSupervisor.init("project-1", "runtime-1");
+    const target = try EntityRef.init(.runtime, "runtime-1", "Runtime");
+    var command = try RuntimeCommand.init("cmd-1", target, "runtime.shutdown", .websocket);
+    command.safety = .destructive;
+    try supervisor.submitCommand(command);
+    try std.testing.expect(!supervisor.shutdown_requested);
+    try std.testing.expectEqual(@as(usize, 1), supervisor.drainCommands(10, 8));
+    try std.testing.expect(supervisor.shutdown_requested);
 }
