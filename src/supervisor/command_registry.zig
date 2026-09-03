@@ -1,7 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
-pub const Handler = *const fn (protocol.RuntimeCommand) anyerror!void;
+pub const Handler = *const fn (*anyopaque, protocol.RuntimeCommand) anyerror!void;
 
 pub const CommandDescriptor = struct {
     canonical_name: protocol.Name,
@@ -43,10 +43,13 @@ pub fn CommandRegistry(comptime capacity: usize) type {
             });
         }
 
-        pub fn execute(self: *const Self, command: protocol.RuntimeCommand) !void {
+        /// Execute a command against an explicit runtime context. The registry
+        /// never stores the context pointer, so it remains safe when the owning
+        /// runtime struct is moved before execution starts.
+        pub fn execute(self: *const Self, user_ctx: *anyopaque, command: protocol.RuntimeCommand) !void {
             const descriptor = self.find(command.canonical_name.slice()) orelse return error.UnknownCommand;
             if (descriptor.safety != command.safety) return error.SafetyClassMismatch;
-            try descriptor.handler(command);
+            try descriptor.handler(user_ctx, command);
         }
 
         pub fn find(self: *const Self, canonical_name: []const u8) ?CommandDescriptor {
@@ -62,8 +65,12 @@ pub fn CommandRegistry(comptime capacity: usize) type {
 test "command registry is fixed capacity and dispatches by canonical name" {
     const Registry = CommandRegistry(1);
     var registry = Registry{};
+    var invoked = false;
     const handler = struct {
-        fn run(_: protocol.RuntimeCommand) !void {}
+        fn run(ctx: *anyopaque, _: protocol.RuntimeCommand) !void {
+            const flag: *bool = @ptrCast(@alignCast(ctx));
+            flag.* = true;
+        }
     }.run;
 
     try registry.registerSimple("config.reload", "config.write", .mutating, handler);
@@ -72,5 +79,6 @@ test "command registry is fixed capacity and dispatches by canonical name" {
     const target = try protocol.EntityRef.init(.runtime, "runtime-1", "Runtime");
     var command = try protocol.RuntimeCommand.init("cmd-1", target, "config.reload", .test);
     command.safety = .mutating;
-    try registry.execute(command);
+    try registry.execute(&invoked, command);
+    try std.testing.expect(invoked);
 }
