@@ -4,12 +4,48 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Main library module
+    // ZigZag TUI foundation.
     const zigzag_mod = b.addModule("zigzag", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // AllasCode DevelopmentSupervisor runtime. This is intentionally a
+    // separate public module so ZigZag remains a generic TUI framework.
+    const supervisor_mod = b.addModule("development_supervisor", .{
+        .root_source_file = b.path("src/supervisor/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const supervisor_exe = b.addExecutable(.{
+        .name = "development-supervisor",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/supervisor/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigzag", .module = zigzag_mod },
+                .{ .name = "development_supervisor", .module = supervisor_mod },
+            },
+        }),
+    });
+
+    // Installing the artifact also makes it available to downstream Zig build
+    // dependencies as the `development-supervisor` artifact.
+    const install_supervisor = b.addInstallArtifact(supervisor_exe, .{});
+    b.getInstallStep().dependOn(&install_supervisor.step);
+
+    const run_supervisor = b.addRunArtifact(supervisor_exe);
+    run_supervisor.step.dependOn(&install_supervisor.step);
+    if (b.args) |args| run_supervisor.addArgs(args);
+
+    const supervise_step = b.step(
+        "supervise",
+        "Start the AllasCode DevelopmentSupervisor real-time control plane",
+    );
+    supervise_step.dependOn(&run_supervisor.step);
 
     // Examples
     const examples = [_][]const u8{
@@ -140,7 +176,7 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_unit_tests.step);
     }
 
-    // Also run tests on the main library
+    // Also run tests on the main ZigZag library.
     const lib_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
@@ -150,6 +186,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
     test_step.dependOn(&run_lib_tests.step);
+
+    // DevelopmentSupervisor foundation tests.
+    const supervisor_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/supervisor_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "development_supervisor", .module = supervisor_mod },
+            },
+        }),
+    });
+    const run_supervisor_tests = b.addRunArtifact(supervisor_tests);
+    test_step.dependOn(&run_supervisor_tests.step);
 
     // WASM library build (for browser-based terminals)
     const wasm_step = b.step("wasm", "Build ZigZag as a WASM library");
