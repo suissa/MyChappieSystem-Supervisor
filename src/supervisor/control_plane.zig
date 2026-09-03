@@ -67,9 +67,9 @@ pub fn ControlPlane(comptime Runtime: type) type {
             if (self.server) |*server| server.deinit(self.io);
             self.server = null;
 
-            // Interrupt any long-lived SSE/WS reads/writes. We close a copy of
-            // the Stream so the connection thread's struct memory is untouched;
-            // it sees closed_by_supervisor and skips a second OS close.
+            // Interrupt long-lived SSE/WS reads/writes. Close a copy of the
+            // Stream handle so the connection thread's struct memory remains
+            // valid; `closed_by_supervisor` prevents a second OS close.
             self.connection_mutex.lock();
             for (&self.connections) |*slot| {
                 if (!slot.active or slot.closed_by_supervisor) continue;
@@ -79,9 +79,11 @@ pub fn ControlPlane(comptime Runtime: type) type {
             }
             self.connection_mutex.unlock();
 
-            // Bounded wait: closing the socket unblocks HTTP/SSE/WS operations.
-            var attempts: usize = 0;
-            while (attempts < 100 and self.activeConnections() != 0) : (attempts += 1) {
+            // Correctness is more important than a timed shutdown here: the
+            // runtime pointer must stay valid until every detached connection
+            // thread has stopped using it. Closing the sockets above unblocks
+            // HTTP, SSE and WebSocket reads/writes.
+            while (self.activeConnections() != 0) {
                 std.Thread.sleep(10 * std.time.ns_per_ms);
             }
             self.runtime = null;
@@ -99,7 +101,9 @@ pub fn ControlPlane(comptime Runtime: type) type {
             self.connection_mutex.lock();
             defer self.connection_mutex.unlock();
             var count: usize = 0;
-            for (self.connections) |slot| if (slot.active) count += 1;
+            for (self.connections) |slot| {
+                if (slot.active) count += 1;
+            }
             return count;
         }
 
@@ -230,7 +234,8 @@ pub fn ControlPlane(comptime Runtime: type) type {
         }
 
         fn respondSnapshot(self: *Self, request: *http.Server.Request) !void {
-            const snapshot = self.runtime.?.readPublishedSnapshot();
+            const runtime = self.runtime orelse return error.RuntimeUnavailable;
+            const snapshot = runtime.readPublishedSnapshot();
             var body_buf: [768]u8 = undefined;
             const body = try snapshotJson(&body_buf, snapshot);
             try request.respond(body, .{
@@ -239,6 +244,7 @@ pub fn ControlPlane(comptime Runtime: type) type {
         }
 
         fn acceptRestCommand(self: *Self, request: *http.Server.Request) !void {
+            const runtime = self.runtime orelse return error.RuntimeUnavailable;
             const content_length_u64 = request.head.content_length orelse return error.ContentLengthRequired;
             if (content_length_u64 == 0 or content_length_u64 > max_command_body_bytes) return error.InvalidContentLength;
             const content_length: usize = @intCast(content_length_u64);
@@ -249,7 +255,7 @@ pub fn ControlPlane(comptime Runtime: type) type {
 
             var command = try ndjson.decodeCommand(body[0..content_length]);
             command.source = .rest;
-            try self.runtime.?.submitCommand(command);
+            try runtime.submitCommand(command);
 
             var response_buf: [256]u8 = undefined;
             const response = try std.fmt.bufPrint(&response_buf,
@@ -263,8 +269,9 @@ pub fn ControlPlane(comptime Runtime: type) type {
         }
 
         fn serveSse(self: *Self, request: *http.Server.Request) !void {
-            const subscriber = try self.runtime.?.subscribe();
-            defer self.runtime.?.unsubscribe(subscriber);
+            const runtime = self.runtime orelse return error.RuntimeUnavailable;
+            const subscriber = try runtime.subscribe();
+            defer runtime.unsubscribe(subscriber);
 
             var send_buffer: [8192]u8 = undefined;
             var response = try request.respondStreaming(&send_buffer, .{
@@ -277,12 +284,11 @@ pub fn ControlPlane(comptime Runtime: type) type {
                 },
             });
 
-            // Initial retry hint for EventSource reconnects.
             try response.writer.writeAll("retry: 1000\n\n");
             try response.flush();
 
             while (!self.stopping.load(.acquire)) {
-                if (self.runtime.?.nextEvent(subscriber)) |event| {
+                if (runtime.nextEvent(subscriber)) |event| {
                     try response.writer.print("id: {d}\nevent: {s}\ndata: ", .{ event.sequence, @tagName(event.kind) });
                     try ndjson.writeEvent(&response.writer, &event);
                     try response.writer.writeByte('\n');
@@ -295,12 +301,14 @@ pub fn ControlPlane(comptime Runtime: type) type {
         }
 
         fn serveWebSocket(self: *Self, ws: *http.Server.WebSocket) void {
-            const subscriber = self.runtime.?.subscribe() catch return;
-            defer self.runtime.?.unsubscribe(subscriber);
+            const runtime = self.runtime orelse return;
+            const subscriber = runtime.subscribe() catch return;
+            defer runtime.unsubscribe(subscriber);
 
             var sender_stop = std.atomic.Value(bool).init(false);
             var sender_ctx = WsSenderContext{
                 .control = self,
+                .runtime = runtime,
                 .ws = ws,
                 .subscriber = subscriber,
                 .stop = &sender_stop,
@@ -318,7 +326,7 @@ pub fn ControlPlane(comptime Runtime: type) type {
                         if (std.mem.eql(u8, message.data, "ping")) continue;
                         var command = ndjson.decodeCommand(message.data) catch continue;
                         command.source = .websocket;
-                        self.runtime.?.submitCommand(command) catch continue;
+                        runtime.submitCommand(command) catch continue;
                     },
                     .ping, .pong => {},
                     else => {},
@@ -328,14 +336,15 @@ pub fn ControlPlane(comptime Runtime: type) type {
 
         const WsSenderContext = struct {
             control: *Self,
+            runtime: *Runtime,
             ws: *http.Server.WebSocket,
-            subscriber: Runtime.DefaultEventBus.SubscriberId,
+            subscriber: usize,
             stop: *std.atomic.Value(bool),
         };
 
         fn wsSender(ctx: *WsSenderContext) void {
             var snapshot_buf: [768]u8 = undefined;
-            const snapshot = ctx.control.runtime.?.readPublishedSnapshot();
+            const snapshot = ctx.runtime.readPublishedSnapshot();
             const snapshot_json = snapshotJson(&snapshot_buf, snapshot) catch return;
 
             var initial_buf: [896]u8 = undefined;
@@ -343,7 +352,7 @@ pub fn ControlPlane(comptime Runtime: type) type {
             ctx.ws.writeMessage(initial, .text) catch return;
 
             while (!ctx.stop.load(.acquire) and !ctx.control.stopping.load(.acquire)) {
-                if (ctx.control.runtime.?.nextEvent(ctx.subscriber)) |event| {
+                if (ctx.runtime.nextEvent(ctx.subscriber)) |event| {
                     var event_buf: [ndjson.max_ndjson_line_bytes]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&event_buf);
                     ndjson.writeEvent(&writer, &event) catch return;
