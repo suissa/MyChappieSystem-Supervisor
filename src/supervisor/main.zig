@@ -13,6 +13,7 @@ const Model = struct {
     recent_events: [10]?ds.RuntimeEvent = [_]?ds.RuntimeEvent{null} ** 10,
     recent_len: usize = 0,
     ticks: u64 = 0,
+    next_local_command_id: u64 = 1,
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -38,6 +39,7 @@ const Model = struct {
         self.recent_events = [_]?ds.RuntimeEvent{null} ** 10;
         self.recent_len = 0;
         self.ticks = 0;
+        self.next_local_command_id = 1;
 
         const boot_action = struct {
             fn run(allocator: std.mem.Allocator) !void {
@@ -68,6 +70,9 @@ const Model = struct {
         switch (msg) {
             .tick => {
                 self.ticks += 1;
+                _ = self.supervisor.drainCommands(ctx.elapsed, 16);
+                if (self.supervisor.shutdown_requested) return .quit;
+
                 self.hardware = self.telemetry_sampler.sample(ctx.io);
                 self.cpu_history.push(self.hardware.cpu_percent) catch {};
                 self.memory_history.push(self.hardware.memory_percent) catch {};
@@ -79,15 +84,26 @@ const Model = struct {
             },
             .key => |key| switch (key.key) {
                 .char => |c| switch (c) {
-                    'q' => return .quit,
+                    'q' => {
+                        self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.shutdown", .destructive) catch {};
+                        _ = self.supervisor.drainCommands(ctx.elapsed, 16);
+                        self.drainEvents();
+                        if (self.supervisor.shutdown_requested) return .quit;
+                    },
                     'r' => {
+                        self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.refresh", .observe) catch {};
+                        _ = self.supervisor.drainCommands(ctx.elapsed, 16);
                         self.hardware = self.telemetry_sampler.sample(ctx.io);
                         self.snapshot = self.supervisor.snapshot();
                         self.drainEvents();
                     },
                     else => {},
                 },
-                .escape => return .quit,
+                .escape => {
+                    self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.shutdown", .destructive) catch {};
+                    _ = self.supervisor.drainCommands(ctx.elapsed, 16);
+                    if (self.supervisor.shutdown_requested) return .quit;
+                },
                 else => {},
             },
         }
@@ -104,10 +120,29 @@ const Model = struct {
 
         var help_style = zz.Style{};
         help_style = help_style.fg(zz.Color.gray(12)).inline_style(true);
-        const help = try help_style.render(ctx.allocator, "q: quit   r: refresh   |   zig build supervise");
+        const help = try help_style.render(ctx.allocator, "q: runtime.shutdown   r: runtime.refresh   |   all controls use CommandRegistry");
         const all = try zz.joinVertical(ctx.allocator, &.{ body, "", help });
 
         return zz.place.place(ctx.allocator, ctx.width, ctx.height, .center, .middle, all);
+    }
+
+    fn submitLocalCommand(
+        self: *Model,
+        kind: ds.EntityKind,
+        target_id: []const u8,
+        target_name: []const u8,
+        canonical_name: []const u8,
+        safety: ds.protocol.SafetyClass,
+    ) !void {
+        var id_buffer: [32]u8 = undefined;
+        const command_id = try std.fmt.bufPrint(&id_buffer, "tui-{d}", .{self.next_local_command_id});
+        self.next_local_command_id +%= 1;
+        if (self.next_local_command_id == 0) self.next_local_command_id = 1;
+
+        const target = try ds.EntityRef.init(kind, target_id, target_name);
+        var command = try ds.RuntimeCommand.init(command_id, target, canonical_name, .tui);
+        command.safety = safety;
+        try self.supervisor.submitCommand(command);
     }
 
     fn emitHardwareMetric(self: *Model, ctx: *zz.Context) void {
@@ -146,13 +181,14 @@ const Model = struct {
         const title = try title_style.render(ctx.allocator, "ALLASCODE DEVELOPMENT SUPERVISOR");
         const live = try live_style.render(ctx.allocator, "● LIVE");
         const meta_raw = try std.fmt.allocPrint(ctx.allocator,
-            "CPU {d:.1}%  RAM {d:.1}%  Actors {d}/{d}/{d}  Events {d}  Dropped {d}  UI {d:.0} fps",
+            "CPU {d:.1}%  RAM {d:.1}%  Actors {d}/{d}/{d}  CmdQ {d}  Events {d}  Dropped {d}  UI {d:.0} fps",
             .{
                 self.hardware.cpu_percent,
                 self.hardware.memory_percent,
                 self.snapshot.actors_running,
                 self.snapshot.actors_waiting,
                 self.snapshot.actors_failed,
+                self.supervisor.command_queue.depth(),
                 self.snapshot.events_emitted,
                 self.snapshot.events_dropped,
                 ctx.fps(),
@@ -170,8 +206,8 @@ const Model = struct {
         heading = heading.bold(true).fg(zz.Color.hex("#42DDF5")).inline_style(true);
         const h = try heading.render(ctx.allocator, "Runtime / Actors");
         const body = try std.fmt.allocPrint(ctx.allocator,
-            "{s}\n\nActions completed  {d}\nActions failed     {d}\nEvent sequence     {d}\nActor slots        16\nMax memory/Actor   64 KiB\nMailbox/Actor      4",
-            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence },
+            "{s}\n\nActions completed  {d}\nActions failed     {d}\nEvent sequence     {d}\nCommands queued    {d}\nActor slots        16\nMax memory/Actor   64 KiB\nMailbox/Actor      4",
+            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence, self.supervisor.command_queue.depth() },
         );
         return box.render(ctx.allocator, body);
     }
