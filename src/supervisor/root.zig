@@ -26,7 +26,9 @@ pub const ActorState = actor_mod.ActorState;
 pub const RestartPolicy = actor_mod.RestartPolicy;
 pub const ActionFn = actor_mod.ActionFn;
 
-pub const DefaultEventBus = event_bus_mod.EventBus(4, 32);
+// Same total event slots as the original 4×32 shape, but twice as many
+// concurrent subscribers for TUI + SSE/WS observers.
+pub const DefaultEventBus = event_bus_mod.EventBus(8, 16);
 pub const DefaultActionSupervisor = actor_mod.ActionSupervisor(16, 64 * 1024, 4);
 pub const DefaultCommandRegistry = command_mod.CommandRegistry(64);
 pub const DefaultCommandQueue = queue_mod.CommandQueue(32);
@@ -39,6 +41,8 @@ pub const DevelopmentSupervisor = struct {
     action_supervisor: DefaultActionSupervisor = DefaultActionSupervisor.init(),
     command_registry: DefaultCommandRegistry = .{},
     command_queue: DefaultCommandQueue = .{},
+    snapshot_mutex: std.Thread.Mutex = .{},
+    published_snapshot: RuntimeSnapshot = .{},
     project_id: protocol_mod.Id = .{},
     runtime_id: protocol_mod.Id = .{},
     shutdown_requested: bool = false,
@@ -51,6 +55,7 @@ pub const DevelopmentSupervisor = struct {
             .runtime_id = try protocol_mod.Id.init(runtime_id),
         };
         try self.registerBuiltins();
+        _ = self.refreshPublishedSnapshot();
         return self;
     }
 
@@ -64,6 +69,10 @@ pub const DevelopmentSupervisor = struct {
 
     pub fn subscribe(self: *Self) !DefaultEventBus.SubscriberId {
         return self.bus.subscribe();
+    }
+
+    pub fn unsubscribe(self: *Self, subscriber: DefaultEventBus.SubscriberId) void {
+        self.bus.unsubscribe(subscriber);
     }
 
     pub fn nextEvent(self: *Self, subscriber: DefaultEventBus.SubscriberId) ?RuntimeEvent {
@@ -84,6 +93,7 @@ pub const DevelopmentSupervisor = struct {
             const command = self.command_queue.pop() orelse break;
             self.executeCommand(command, timestamp_ns) catch {};
         }
+        if (processed > 0) _ = self.refreshPublishedSnapshot();
         return processed;
     }
 
@@ -91,9 +101,11 @@ pub const DevelopmentSupervisor = struct {
         try self.emit(command.target, .command_accepted, .info, timestamp_ns, command.canonical_name.slice());
         self.command_registry.execute(self, command) catch |err| {
             try self.emit(command.target, .command_failed, .err, timestamp_ns, @errorName(err));
+            _ = self.refreshPublishedSnapshot();
             return err;
         };
         try self.emit(command.target, .command_completed, .info, timestamp_ns, command.canonical_name.slice());
+        _ = self.refreshPublishedSnapshot();
     }
 
     pub fn spawnAction(
@@ -106,6 +118,7 @@ pub const DevelopmentSupervisor = struct {
     ) !actor_mod.ActorId {
         const id = try self.action_supervisor.spawn(canonical_name, action, memory_quota, restart_policy);
         try self.emitActor(id, canonical_name, .created, .info, timestamp_ns, "");
+        _ = self.refreshPublishedSnapshot();
         return id;
     }
 
@@ -128,10 +141,12 @@ pub const DevelopmentSupervisor = struct {
                 try self.emitActor(actor_id, name.slice(), .memory_exhausted, .err, timestamp_ns, payload);
                 const replacement_id = try self.action_supervisor.replace(actor_id);
                 try self.emitActor(replacement_id, name.slice(), .replaced, .warn, timestamp_ns, "fresh bounded memory region");
+                _ = self.refreshPublishedSnapshot();
                 return replacement_id;
             },
             else => {
                 try self.emitActor(actor_id, name.slice(), .failed, .err, timestamp_ns, @errorName(err));
+                _ = self.refreshPublishedSnapshot();
                 return err;
             },
         };
@@ -152,6 +167,7 @@ pub const DevelopmentSupervisor = struct {
         }
 
         try self.emitActor(actor_id, name.slice(), .completed, .info, timestamp_ns, "");
+        _ = self.refreshPublishedSnapshot();
         return actor_id;
     }
 
@@ -176,11 +192,14 @@ pub const DevelopmentSupervisor = struct {
         try self.bus.publish(event);
     }
 
-    pub fn snapshot(self: *const Self) RuntimeSnapshot {
+    /// Owner-thread snapshot. Actor state is read only here; network threads
+    /// must use `readPublishedSnapshot()` instead.
+    pub fn snapshot(self: *Self) RuntimeSnapshot {
+        const bus_stats = self.bus.stats();
         var out = RuntimeSnapshot{
-            .sequence = self.bus.next_sequence -| 1,
-            .events_emitted = self.bus.emitted,
-            .events_dropped = self.bus.coalesced_or_dropped,
+            .sequence = bus_stats.last_sequence,
+            .events_emitted = bus_stats.emitted,
+            .events_dropped = bus_stats.coalesced_or_dropped,
         };
 
         for (self.action_supervisor.slots) |slot| {
@@ -197,6 +216,20 @@ pub const DevelopmentSupervisor = struct {
             }
         }
         return out;
+    }
+
+    pub fn refreshPublishedSnapshot(self: *Self) RuntimeSnapshot {
+        const current = self.snapshot();
+        self.snapshot_mutex.lock();
+        self.published_snapshot = current;
+        self.snapshot_mutex.unlock();
+        return current;
+    }
+
+    pub fn readPublishedSnapshot(self: *Self) RuntimeSnapshot {
+        self.snapshot_mutex.lock();
+        defer self.snapshot_mutex.unlock();
+        return self.published_snapshot;
     }
 
     fn emitActor(
@@ -314,4 +347,12 @@ test "external commands are serialized through bounded queue" {
     try std.testing.expect(!supervisor.shutdown_requested);
     try std.testing.expectEqual(@as(usize, 1), supervisor.drainCommands(10, 8));
     try std.testing.expect(supervisor.shutdown_requested);
+}
+
+test "published snapshot is safe copy for remote readers" {
+    var supervisor = try DevelopmentSupervisor.init("project-1", "runtime-1");
+    const a = supervisor.refreshPublishedSnapshot();
+    const b = supervisor.readPublishedSnapshot();
+    try std.testing.expectEqual(a.sequence, b.sequence);
+    try std.testing.expectEqual(a.events_emitted, b.events_emitted);
 }
