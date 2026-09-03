@@ -14,6 +14,7 @@ const Model = struct {
     recent_len: usize = 0,
     ticks: u64 = 0,
     next_local_command_id: u64 = 1,
+    command_queue_depth: usize = 0,
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -40,6 +41,7 @@ const Model = struct {
         self.recent_len = 0;
         self.ticks = 0;
         self.next_local_command_id = 1;
+        self.command_queue_depth = 0;
 
         const boot_action = struct {
             fn run(allocator: std.mem.Allocator) !void {
@@ -57,7 +59,7 @@ const Model = struct {
         );
         _ = try self.supervisor.runAction(actor_id, 1);
         self.drainEvents();
-        self.snapshot = self.supervisor.snapshot();
+        self.refreshRuntimeSnapshot();
         return zz.Cmd(Msg).tickMs(250);
     }
 
@@ -79,7 +81,7 @@ const Model = struct {
 
                 if (self.ticks % 4 == 0) self.emitHardwareMetric(ctx);
                 self.drainEvents();
-                self.snapshot = self.supervisor.snapshot();
+                self.refreshRuntimeSnapshot();
                 return zz.Cmd(Msg).tickMs(250);
             },
             .key => |key| switch (key.key) {
@@ -88,20 +90,23 @@ const Model = struct {
                         self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.shutdown", .destructive) catch {};
                         _ = self.supervisor.drainCommands(ctx.elapsed, 16);
                         self.drainEvents();
+                        self.refreshRuntimeSnapshot();
                         if (self.supervisor.shutdown_requested) return .quit;
                     },
                     'r' => {
                         self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.refresh", .observe) catch {};
                         _ = self.supervisor.drainCommands(ctx.elapsed, 16);
                         self.hardware = self.telemetry_sampler.sample(ctx.io);
-                        self.snapshot = self.supervisor.snapshot();
                         self.drainEvents();
+                        self.refreshRuntimeSnapshot();
                     },
                     else => {},
                 },
                 .escape => {
                     self.submitLocalCommand(.runtime, "development-supervisor", "Runtime", "runtime.shutdown", .destructive) catch {};
                     _ = self.supervisor.drainCommands(ctx.elapsed, 16);
+                    self.drainEvents();
+                    self.refreshRuntimeSnapshot();
                     if (self.supervisor.shutdown_requested) return .quit;
                 },
                 else => {},
@@ -124,6 +129,11 @@ const Model = struct {
         const all = try zz.joinVertical(ctx.allocator, &.{ body, "", help });
 
         return zz.place.place(ctx.allocator, ctx.width, ctx.height, .center, .middle, all);
+    }
+
+    fn refreshRuntimeSnapshot(self: *Model) void {
+        self.snapshot = self.supervisor.snapshot();
+        self.command_queue_depth = self.supervisor.command_queue.depth();
     }
 
     fn submitLocalCommand(
@@ -188,7 +198,7 @@ const Model = struct {
                 self.snapshot.actors_running,
                 self.snapshot.actors_waiting,
                 self.snapshot.actors_failed,
-                self.supervisor.command_queue.depth(),
+                self.command_queue_depth,
                 self.snapshot.events_emitted,
                 self.snapshot.events_dropped,
                 ctx.fps(),
@@ -207,7 +217,7 @@ const Model = struct {
         const h = try heading.render(ctx.allocator, "Runtime / Actors");
         const body = try std.fmt.allocPrint(ctx.allocator,
             "{s}\n\nActions completed  {d}\nActions failed     {d}\nEvent sequence     {d}\nCommands queued    {d}\nActor slots        16\nMax memory/Actor   64 KiB\nMailbox/Actor      4",
-            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence, self.supervisor.command_queue.depth() },
+            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence, self.command_queue_depth },
         );
         return box.render(ctx.allocator, body);
     }
