@@ -4,12 +4,14 @@ const event_bus_mod = @import("event_bus.zig");
 const actor_mod = @import("actor_supervisor.zig");
 const command_mod = @import("command_registry.zig");
 const stdio_mod = @import("stdio_bridge.zig");
+const telemetry_mod = @import("telemetry.zig");
 
 pub const protocol = protocol_mod;
 pub const event_bus = event_bus_mod;
 pub const actors = actor_mod;
 pub const commands = command_mod;
 pub const stdio_bridge = stdio_mod;
+pub const telemetry = telemetry_mod;
 
 pub const RuntimeEvent = protocol_mod.RuntimeEvent;
 pub const RuntimeCommand = protocol_mod.RuntimeCommand;
@@ -90,6 +92,27 @@ pub const DevelopmentSupervisor = struct {
         return actor_id;
     }
 
+    pub fn emit(
+        self: *Self,
+        entity: EntityRef,
+        kind: EventKind,
+        severity: Severity,
+        timestamp_ns: u64,
+        payload: []const u8,
+    ) !void {
+        var event = RuntimeEvent{
+            .sequence = self.bus.reserveSequence(),
+            .timestamp_ns = timestamp_ns,
+            .entity = entity,
+            .kind = kind,
+            .severity = severity,
+        };
+        event.project_id = self.project_id;
+        event.runtime_id = self.runtime_id;
+        try event.payload.set(payload);
+        try self.bus.publish(event);
+    }
+
     pub fn snapshot(self: *const Self) RuntimeSnapshot {
         var out = RuntimeSnapshot{
             .sequence = self.bus.next_sequence -| 1,
@@ -124,16 +147,7 @@ pub const DevelopmentSupervisor = struct {
         var id_buf: [32]u8 = undefined;
         const actor_id_text = formatActorId(&id_buf, actor_id);
         const entity = try EntityRef.init(.actor, actor_id_text, canonical_name);
-        var event = RuntimeEvent{
-            .sequence = self.bus.reserveSequence(),
-            .timestamp_ns = timestamp_ns,
-            .entity = entity,
-            .kind = kind,
-            .severity = severity,
-        };
-        event.project_id = self.project_id;
-        event.runtime_id = self.runtime_id;
-        try self.bus.publish(event);
+        try self.emit(entity, kind, severity, timestamp_ns, "");
     }
 };
 
