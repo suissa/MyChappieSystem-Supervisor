@@ -66,6 +66,8 @@ pub fn ActionSupervisor(
             restarts: u16 = 0,
             memory_quota: usize = 0,
             soft_limit_percent: u8 = 80,
+            last_memory_used: usize = 0,
+            peak_memory_used: usize = 0,
             storage: [max_actor_memory_bytes]u8 = undefined,
             fba: std.heap.FixedBufferAllocator = undefined,
             action: ?ActionFn = null,
@@ -75,7 +77,16 @@ pub fn ActionSupervisor(
 
             fn prepare(self: *ActorSlot, quota: usize) void {
                 self.memory_quota = quota;
+                // A new attempt never observes bytes from a previous attempt or
+                // a previous Actor that occupied this slot.
+                @memset(self.storage[0..quota], 0);
                 self.fba = std.heap.FixedBufferAllocator.init(self.storage[0..quota]);
+                self.last_memory_used = 0;
+            }
+
+            fn recordUsage(self: *ActorSlot) void {
+                self.last_memory_used = self.fba.end_index;
+                self.peak_memory_used = @max(self.peak_memory_used, self.last_memory_used);
             }
 
             pub fn allocator(self: *ActorSlot) std.mem.Allocator {
@@ -84,6 +95,17 @@ pub fn ActionSupervisor(
 
             pub fn mailboxLag(self: *const ActorSlot) usize {
                 return self.mailbox_len;
+            }
+
+            pub fn memoryPercent(self: *const ActorSlot) f64 {
+                if (self.memory_quota == 0) return 0;
+                return @as(f64, @floatFromInt(self.last_memory_used)) * 100.0 /
+                    @as(f64, @floatFromInt(self.memory_quota));
+            }
+
+            pub fn underMemoryPressure(self: *const ActorSlot) bool {
+                if (self.memory_quota == 0) return false;
+                return self.last_memory_used * 100 >= self.memory_quota * self.soft_limit_percent;
             }
         };
 
@@ -156,13 +178,13 @@ pub fn ActionSupervisor(
             }
 
             const action = slot.action orelse return error.InvalidState;
-            // A fresh arena is reconstructed for every execution/attempt.
-            // The Action only receives this bounded allocator through the
-            // trusted-native contract.
+            // A fresh fixed arena is reconstructed for every execution/attempt.
+            // Trusted native Actions only receive this bounded allocator.
             slot.prepare(slot.memory_quota);
             slot.state = .running;
 
             action(slot.allocator()) catch |err| {
+                slot.recordUsage();
                 switch (err) {
                     error.OutOfMemory => {
                         slot.state = .memory_exhausted;
@@ -174,6 +196,7 @@ pub fn ActionSupervisor(
                     },
                 }
             };
+            slot.recordUsage();
             slot.state = .completed;
         }
 
@@ -200,7 +223,6 @@ pub fn ActionSupervisor(
 
         pub fn release(self: *Self, actor_id: ActorId) void {
             const slot = self.find(actor_id) orelse return;
-            // Zero runtime-owned memory before returning the slot to the pool.
             @memset(slot.storage[0..slot.memory_quota], 0);
             slot.* = .{};
         }
@@ -248,6 +270,21 @@ test "actor memory is strictly bounded by FixedBufferAllocator" {
     const id = try supervisor.spawn("Test.memoryBound", action, 64, .transient);
     try std.testing.expectError(error.ActorMemoryExhausted, supervisor.run(id));
     try std.testing.expectEqual(ActorState.memory_exhausted, supervisor.get(id).?.state);
+}
+
+test "actor memory usage and pressure are observable" {
+    const Supervisor = ActionSupervisor(1, 128, 1);
+    var supervisor = Supervisor.init();
+    const action = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = try allocator.alloc(u8, 96);
+        }
+    }.run;
+    const id = try supervisor.spawn("Test.pressure", action, 112, .transient);
+    try supervisor.run(id);
+    const slot = supervisor.get(id).?;
+    try std.testing.expect(slot.last_memory_used >= 96);
+    try std.testing.expect(slot.underMemoryPressure());
 }
 
 test "mailbox is bounded" {
