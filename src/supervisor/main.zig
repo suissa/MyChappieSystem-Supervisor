@@ -6,6 +6,10 @@ const Model = struct {
     supervisor: ds.DevelopmentSupervisor,
     subscriber: ds.DefaultEventBus.SubscriberId,
     snapshot: ds.RuntimeSnapshot = .{},
+    telemetry_sampler: ds.telemetry.Sampler = .{},
+    hardware: ds.telemetry.HardwareSample = .{},
+    cpu_history: zz.Sparkline,
+    memory_history: zz.Sparkline,
     recent_events: [10]?ds.RuntimeEvent = [_]?ds.RuntimeEvent{null} ** 10,
     recent_len: usize = 0,
     ticks: u64 = 0,
@@ -15,10 +19,22 @@ const Model = struct {
         tick: zz.msg.Tick,
     };
 
-    pub fn init(self: *Model, _: *zz.Context) !zz.Cmd(Msg) {
+    pub fn init(self: *Model, ctx: *zz.Context) !zz.Cmd(Msg) {
         self.supervisor = try ds.DevelopmentSupervisor.init("allascode-project", "development-supervisor");
         self.subscriber = try self.supervisor.subscribe();
         self.snapshot = self.supervisor.snapshot();
+        self.telemetry_sampler = .{};
+        self.hardware = self.telemetry_sampler.sample(ctx.io);
+        self.cpu_history = zz.Sparkline.init(ctx.persistent_allocator);
+        self.memory_history = zz.Sparkline.init(ctx.persistent_allocator);
+        self.cpu_history.setWidth(34);
+        self.memory_history.setWidth(34);
+        self.cpu_history.setRetentionLimit(60);
+        self.memory_history.setRetentionLimit(60);
+        self.cpu_history.setGradient(zz.Color.hex("#66F7FF"), zz.Color.hex("#A45CFF"));
+        self.memory_history.setGradient(zz.Color.hex("#52A7FF"), zz.Color.hex("#D05CFF"));
+        try self.cpu_history.push(self.hardware.cpu_percent);
+        try self.memory_history.push(self.hardware.memory_percent);
         self.recent_events = [_]?ds.RuntimeEvent{null} ** 10;
         self.recent_len = 0;
         self.ticks = 0;
@@ -43,10 +59,20 @@ const Model = struct {
         return zz.Cmd(Msg).tickMs(250);
     }
 
-    pub fn update(self: *Model, msg: Msg, _: *zz.Context) zz.Cmd(Msg) {
+    pub fn deinit(self: *Model) void {
+        self.cpu_history.deinit();
+        self.memory_history.deinit();
+    }
+
+    pub fn update(self: *Model, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
         switch (msg) {
             .tick => {
                 self.ticks += 1;
+                self.hardware = self.telemetry_sampler.sample(ctx.io);
+                self.cpu_history.push(self.hardware.cpu_percent) catch {};
+                self.memory_history.push(self.hardware.memory_percent) catch {};
+
+                if (self.ticks % 4 == 0) self.emitHardwareMetric(ctx);
                 self.drainEvents();
                 self.snapshot = self.supervisor.snapshot();
                 return zz.Cmd(Msg).tickMs(250);
@@ -55,6 +81,7 @@ const Model = struct {
                 .char => |c| switch (c) {
                     'q' => return .quit,
                     'r' => {
+                        self.hardware = self.telemetry_sampler.sample(ctx.io);
                         self.snapshot = self.supervisor.snapshot();
                         self.drainEvents();
                     },
@@ -70,9 +97,9 @@ const Model = struct {
     pub fn view(self: *const Model, ctx: *const zz.Context) ![]const u8 {
         const header = try self.renderHeader(ctx);
         const runtime = try self.renderRuntime(ctx);
-        const actors = try self.renderActors(ctx);
+        const hardware = try self.renderHardware(ctx);
         const events = try self.renderEvents(ctx);
-        const top = try zz.joinHorizontal(ctx.allocator, &.{ runtime, "  ", actors });
+        const top = try zz.joinHorizontal(ctx.allocator, &.{ runtime, "  ", hardware });
         const body = try zz.joinVertical(ctx.allocator, &.{ header, "", top, "", events });
 
         var help_style = zz.Style{};
@@ -81,6 +108,16 @@ const Model = struct {
         const all = try zz.joinVertical(ctx.allocator, &.{ body, "", help });
 
         return zz.place.place(ctx.allocator, ctx.width, ctx.height, .center, .middle, all);
+    }
+
+    fn emitHardwareMetric(self: *Model, ctx: *zz.Context) void {
+        var payload_buffer: [256]u8 = undefined;
+        const payload = std.fmt.bufPrint(&payload_buffer,
+            "cpu_percent={d:.2} memory_percent={d:.2} load_1m={d:.2} processes={d}",
+            .{ self.hardware.cpu_percent, self.hardware.memory_percent, self.hardware.load_1m, self.hardware.process_count },
+        ) catch return;
+        const entity = ds.EntityRef.init(.server, "local", "Hardware.local") catch return;
+        self.supervisor.emit(entity, .metric_sampled, .info, ctx.elapsed, payload) catch {};
     }
 
     fn drainEvents(self: *Model) void {
@@ -109,8 +146,10 @@ const Model = struct {
         const title = try title_style.render(ctx.allocator, "ALLASCODE DEVELOPMENT SUPERVISOR");
         const live = try live_style.render(ctx.allocator, "● LIVE");
         const meta_raw = try std.fmt.allocPrint(ctx.allocator,
-            "Actors {d} running / {d} waiting / {d} failed   Events {d}   Dropped {d}   UI {d:.0} fps",
+            "CPU {d:.1}%  RAM {d:.1}%  Actors {d}/{d}/{d}  Events {d}  Dropped {d}  UI {d:.0} fps",
             .{
+                self.hardware.cpu_percent,
+                self.hardware.memory_percent,
                 self.snapshot.actors_running,
                 self.snapshot.actors_waiting,
                 self.snapshot.actors_failed,
@@ -129,30 +168,47 @@ const Model = struct {
         box = box.borderAll(zz.Border.rounded).borderForeground(zz.Color.hex("#42DDF5")).paddingAll(1).width(40);
         var heading = zz.Style{};
         heading = heading.bold(true).fg(zz.Color.hex("#42DDF5")).inline_style(true);
-        const h = try heading.render(ctx.allocator, "Runtime");
+        const h = try heading.render(ctx.allocator, "Runtime / Actors");
         const body = try std.fmt.allocPrint(ctx.allocator,
-            "{s}\n\nActions completed  {d}\nActions failed     {d}\nEvent sequence     {d}\nRefresh ticks      {d}",
-            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence, self.ticks },
+            "{s}\n\nActions completed  {d}\nActions failed     {d}\nEvent sequence     {d}\nActor slots        16\nMax memory/Actor   64 KiB\nMailbox/Actor      4",
+            .{ h, self.snapshot.actions_completed, self.snapshot.actions_failed, self.snapshot.sequence },
         );
         return box.render(ctx.allocator, body);
     }
 
-    fn renderActors(self: *const Model, ctx: *const zz.Context) ![]const u8 {
+    fn renderHardware(self: *const Model, ctx: *const zz.Context) ![]const u8 {
         var box = zz.Style{};
-        box = box.borderAll(zz.Border.rounded).borderForeground(zz.Color.hex("#985DFF")).paddingAll(1).width(40);
+        box = box.borderAll(zz.Border.rounded).borderForeground(zz.Color.hex("#985DFF")).paddingAll(1).width(42);
         var heading = zz.Style{};
         heading = heading.bold(true).fg(zz.Color.hex("#985DFF")).inline_style(true);
-        const h = try heading.render(ctx.allocator, "Bounded Actor Runtime");
+        const h = try heading.render(ctx.allocator, "Hardware — realtime");
+        const cpu_graph = try self.cpu_history.view(ctx.allocator);
+        const memory_graph = try self.memory_history.view(ctx.allocator);
+        const used_mib = self.hardware.memory_used_bytes / (1024 * 1024);
+        const total_mib = self.hardware.memory_total_bytes / (1024 * 1024);
+        const provider = if (self.hardware.supported) "native" else "not available";
         const body = try std.fmt.allocPrint(ctx.allocator,
-            "{s}\n\nSlots              16\nMax memory / Actor 64 KiB\nMailbox / Actor    4 commands\nHeap growth         disabled by contract",
-            .{h},
+            "{s}\nCPU    {d:>5.1}%  {s}\n{s}\nRAM    {d:>5.1}%  {d}/{d} MiB\n{s}\nLoad   {d:.2}    Processes {d}\nProvider: {s}",
+            .{
+                h,
+                self.hardware.cpu_percent,
+                "",
+                cpu_graph,
+                self.hardware.memory_percent,
+                used_mib,
+                total_mib,
+                memory_graph,
+                self.hardware.load_1m,
+                self.hardware.process_count,
+                provider,
+            },
         );
         return box.render(ctx.allocator, body);
     }
 
     fn renderEvents(self: *const Model, ctx: *const zz.Context) ![]const u8 {
         var box = zz.Style{};
-        box = box.borderAll(zz.Border.rounded).borderForeground(zz.Color.hex("#666BFF")).paddingAll(1).width(82);
+        box = box.borderAll(zz.Border.rounded).borderForeground(zz.Color.hex("#666BFF")).paddingAll(1).width(84);
         var heading = zz.Style{};
         heading = heading.bold(true).fg(zz.Color.hex("#666BFF")).inline_style(true);
         const h = try heading.render(ctx.allocator, "Recent RuntimeEvents");
