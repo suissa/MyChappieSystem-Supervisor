@@ -63,7 +63,7 @@ pub const DevelopmentSupervisor = struct {
         timestamp_ns: u64,
     ) !actor_mod.ActorId {
         const id = try self.action_supervisor.spawn(canonical_name, action, memory_quota, restart_policy);
-        try self.emitActor(id, canonical_name, .created, .info, timestamp_ns);
+        try self.emitActor(id, canonical_name, .created, .info, timestamp_ns, "");
         return id;
     }
 
@@ -73,22 +73,43 @@ pub const DevelopmentSupervisor = struct {
     pub fn runAction(self: *Self, actor_id: actor_mod.ActorId, timestamp_ns: u64) !actor_mod.ActorId {
         const slot = self.action_supervisor.get(actor_id) orelse return error.ActorNotFound;
         const name = slot.canonical_name;
-        try self.emitActor(actor_id, name.slice(), .started, .info, timestamp_ns);
+        try self.emitActor(actor_id, name.slice(), .started, .info, timestamp_ns, "");
 
         self.action_supervisor.run(actor_id) catch |err| switch (err) {
             error.ActorMemoryExhausted => {
-                try self.emitActor(actor_id, name.slice(), .memory_exhausted, .err, timestamp_ns);
+                const exhausted_slot = self.action_supervisor.get(actor_id).?;
+                var payload_buf: [160]u8 = undefined;
+                const payload = std.fmt.bufPrint(&payload_buf,
+                    "used={d} quota={d} peak={d}",
+                    .{ exhausted_slot.last_memory_used, exhausted_slot.memory_quota, exhausted_slot.peak_memory_used },
+                ) catch "";
+                try self.emitActor(actor_id, name.slice(), .memory_exhausted, .err, timestamp_ns, payload);
                 const replacement_id = try self.action_supervisor.replace(actor_id);
-                try self.emitActor(replacement_id, name.slice(), .replaced, .warn, timestamp_ns);
+                try self.emitActor(replacement_id, name.slice(), .replaced, .warn, timestamp_ns, "fresh bounded memory region");
                 return replacement_id;
             },
             else => {
-                try self.emitActor(actor_id, name.slice(), .failed, .err, timestamp_ns);
+                try self.emitActor(actor_id, name.slice(), .failed, .err, timestamp_ns, @errorName(err));
                 return err;
             },
         };
 
-        try self.emitActor(actor_id, name.slice(), .completed, .info, timestamp_ns);
+        const completed_slot = self.action_supervisor.get(actor_id).?;
+        if (completed_slot.underMemoryPressure()) {
+            var payload_buf: [160]u8 = undefined;
+            const payload = std.fmt.bufPrint(&payload_buf,
+                "used={d} quota={d} percent={d:.2} soft_limit={d}",
+                .{
+                    completed_slot.last_memory_used,
+                    completed_slot.memory_quota,
+                    completed_slot.memoryPercent(),
+                    completed_slot.soft_limit_percent,
+                },
+            ) catch "";
+            try self.emitActor(actor_id, name.slice(), .memory_pressure, .warn, timestamp_ns, payload);
+        }
+
+        try self.emitActor(actor_id, name.slice(), .completed, .info, timestamp_ns, "");
         return actor_id;
     }
 
@@ -120,7 +141,7 @@ pub const DevelopmentSupervisor = struct {
             .events_dropped = self.bus.coalesced_or_dropped,
         };
 
-        for (&self.action_supervisor.slots) |slot| {
+        for (self.action_supervisor.slots) |slot| {
             if (!slot.active) continue;
             switch (slot.state) {
                 .running => out.actors_running += 1,
@@ -143,11 +164,12 @@ pub const DevelopmentSupervisor = struct {
         kind: EventKind,
         severity: Severity,
         timestamp_ns: u64,
+        payload: []const u8,
     ) !void {
         var id_buf: [32]u8 = undefined;
         const actor_id_text = formatActorId(&id_buf, actor_id);
         const entity = try EntityRef.init(.actor, actor_id_text, canonical_name);
-        try self.emit(entity, kind, severity, timestamp_ns, "");
+        try self.emit(entity, kind, severity, timestamp_ns, payload);
     }
 };
 
@@ -193,4 +215,23 @@ test "DevelopmentSupervisor emits ActionActor lifecycle" {
         }
     }
     try std.testing.expect(seen_created and seen_started and seen_completed);
+}
+
+test "DevelopmentSupervisor emits memory pressure before completion" {
+    var supervisor = try DevelopmentSupervisor.init("project-1", "runtime-1");
+    const subscriber = try supervisor.subscribe();
+    const action = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            _ = try allocator.alloc(u8, 900);
+        }
+    }.run;
+
+    const actor_id = try supervisor.spawnAction("Test.pressure", action, 1024, .transient, 1);
+    _ = try supervisor.runAction(actor_id, 2);
+
+    var seen_pressure = false;
+    while (supervisor.nextEvent(subscriber)) |event| {
+        if (event.kind == .memory_pressure) seen_pressure = true;
+    }
+    try std.testing.expect(seen_pressure);
 }
